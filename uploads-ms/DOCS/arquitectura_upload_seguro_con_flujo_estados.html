@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arquitectura de Upload Seguro en Microservicios</title>
+<style>
+  @page { size: A4; margin: 18mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    color: #111;
+    line-height: 1.45;
+    max-width: 210mm;
+    margin: 0 auto;
+    background: #fff;
+    font-size: 11pt;
+  }
+  h1 { font-size: 22pt; margin: 0 0 10px; }
+  h2 {
+    font-size: 15pt;
+    margin-top: 24px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #999;
+  }
+  h3 { font-size: 12pt; margin-top: 18px; }
+  p { margin: 7px 0; }
+  ul, ol { margin-top: 6px; }
+  code { font-family: "Courier New", monospace; font-size: 9.5pt; }
+  pre {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    border: 1px solid #bbb;
+    padding: 10px;
+    border-radius: 4px;
+    background: #fafafa;
+    page-break-inside: avoid;
+  }
+  .box {
+    border: 1px solid #777;
+    padding: 10px 12px;
+    margin: 10px 0;
+    page-break-inside: avoid;
+  }
+  .note {
+    border-left: 4px solid #666;
+    padding-left: 10px;
+    margin: 10px 0;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0;
+    page-break-inside: avoid;
+  }
+  th, td {
+    border: 1px solid #888;
+    padding: 7px;
+    vertical-align: top;
+  }
+  th { background: #eee; }
+  .cover {
+    min-height: 240mm;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+</style>
+</head>
+<body>
+
+<section class="cover">
+  <h1>Arquitectura de Upload Seguro en Microservicios</h1>
+  <p><strong>Diseño implementado:</strong> el Gateway recibe y conserva los archivos físicos. Upload-MS se especializa en validar el contenido real del archivo.</p>
+
+  <div class="box">
+<pre>Frontend
+   |
+   | HTTP multipart/form-data
+   v
+Gateway
+   |
+   | autenticación
+   | tamaño / extensión / MIME
+   | UUID
+   v
+uploads/quarantine/
+   |
+   | metadata por TCP
+   v
+Upload-MS
+   |
+   | firma / magic bytes
+   | estructura real del PDF
+   |
+   +---- REJECTED --------------------+
+   |                                  |
+   |                                  v
+   |                              Gateway
+   |                                  |
+   |                               unlink()
+   |                                  |
+   |                              ELIMINADO
+   |
+   +---- STRUCTURE_VALIDATED ---------+
+                                      |
+                                      v
+                                   Gateway
+                                      |
+                                   rename()
+                                      |
+                                      v
+                               uploads/verified/</pre>
+  </div>
+
+  <p class="note"><strong>Estado actual:</strong> recepción, validación inicial, UUID, cuarentena, comunicación TCP, validación de firma PDF, validación estructural con pdf-lib, eliminación de rechazados y movimiento de archivos estructuralmente válidos a <code>verified/</code>.</p>
+</section>
+
+<h2>1. Entrada del archivo</h2>
+
+<pre>Frontend
+   |
+   | HTTP multipart/form-data
+   v
+Gateway NestJS
+   |
+   v
+Multer</pre>
+
+<p>El Gateway es el punto de entrada HTTP. Multer recibe el archivo mediante <code>FileInterceptor</code>.</p>
+
+<h3>Ejemplo: recepción del archivo</h3>
+<p>Este código crea el endpoint <code>POST /upload</code>. <code>FileInterceptor('file')</code> indica que Multer debe buscar dentro del formulario multipart un campo llamado <code>file</code>. Luego <code>@UploadedFile()</code> entrega al método el archivo recibido, incluyendo nombre original, MIME, tamaño y buffer.</p>
+<pre><code>// Define un endpoint HTTP POST /upload.
+@Post()
+
+// Intercepta el campo "file" del multipart/form-data.
+// Multer procesa el archivo antes de ejecutar uploadFile().
+@UseInterceptors(FileInterceptor('file'))
+
+uploadFile(
+  // Recupera el archivo procesado por Multer.
+  // Express.Multer.File contiene originalname, mimetype,
+  // size, buffer, etc.
+  @UploadedFile() file: Express.Multer.File,
+) {
+  // A partir de aquí el Gateway puede validar
+  // y procesar el archivo recibido.
+}</code></pre>
+
+<h2>2. Validación inicial en Gateway</h2>
+
+<p>Antes de escribir el archivo en disco, el Gateway realiza controles rápidos:</p>
+<ul>
+  <li>Usuario autenticado.</li>
+  <li>Tamaño máximo: 10 MB.</li>
+  <li>Extensión permitida.</li>
+  <li>MIME declarado permitido.</li>
+</ul>
+
+<p>Allow-list inicial:</p>
+<pre>.pdf
+.png
+.jpg
+.jpeg
+.docx
+.xlsx</pre>
+
+<p>Estas validaciones son preventivas, pero no confirman el contenido real.</p>
+
+<h3>Ejemplo: validación rápida en el Gateway</h3>
+<p>Esta capa no analiza todavía el contenido interno. Su objetivo es descartar rápidamente formatos que la aplicación no admite antes de escribirlos en disco.</p>
+<pre><code>// Obtiene la extensión del nombre original y la normaliza.
+// Ejemplo: "Trabajo.PDF" pasa a ".pdf".
+const extension =
+  extname(file.originalname).toLowerCase();
+
+// Comprueba que la extensión esté en nuestra allow-list:
+// .pdf, .png, .jpg, .jpeg, .docx, .xlsx.
+const extensionIsValid =
+  allowedExtensions.includes(extension);
+
+// Comprueba el MIME declarado durante el upload.
+// Ejemplo esperado para PDF: application/pdf.
+const mimeIsValid =
+  allowedMimeTypes.includes(file.mimetype);
+
+// Si falla cualquiera de los dos controles,
+// Multer rechaza el archivo y Gateway responde HTTP 400.
+if (!extensionIsValid || !mimeIsValid) {
+  return callback(
+    new BadRequestException(
+      'Formato de archivo no permitido',
+    ),
+    false,
+  );
+}</code></pre>
+<p class="note"><strong>Importante:</strong> extensión y MIME pueden ser manipulados. Por eso esta validación pertenece al Gateway como filtro inicial, mientras que Upload-MS inspecciona posteriormente los bytes y la estructura real.</p>
+
+<h2>3. Generación de UUID</h2>
+
+<pre>Nombre original:
+archivo.pdf
+
+Nombre físico:
+4038361e-423f-45b0-9715-88c439a2f3bf.pdf</pre>
+
+<p>El UUID evita utilizar directamente el nombre enviado por el usuario como nombre físico del archivo.</p>
+<pre><code>// Genera un identificador único controlado por el servidor.
+const uuid = randomUUID();
+
+// Conservamos únicamente la extensión previamente permitida.
+const extension =
+  extname(file.originalname).toLowerCase();
+
+// Construimos el nombre físico.
+// Ejemplo:
+// 4038361e-423f-45b0-9715-88c439a2f3bf.pdf
+const storedName =
+  `${uuid}${extension}`;</code></pre>
+
+<p>El usuario no controla el nombre físico del archivo.</p>
+
+<h2>4. Cuarentena</h2>
+
+<pre>gateway/
+└── uploads/
+    ├── quarantine/
+    └── verified/</pre>
+
+<p>Todo archivo aceptado inicialmente entra primero en <code>quarantine/</code>. Esa carpeta no debe exponerse como estática ni permitir descarga directa.</p>
+
+<h3>Ejemplo: escritura controlada en cuarentena</h3>
+<pre><code>// process.cwd() apunta al directorio desde donde
+// se está ejecutando el Gateway.
+//
+// join() construye una ruta segura para el sistema operativo.
+const quarantinePath = join(
+  process.cwd(),
+  'uploads',
+  'quarantine',
+  storedName,
+);
+
+// Multer mantiene el archivo temporalmente en memoria.
+// Recién después de superar las validaciones iniciales
+// escribimos ese buffer en quarantine/.
+await writeFile(
+  quarantinePath,
+  file.buffer,
+);</code></pre>
+<p>En este punto el archivo existe físicamente, pero continúa siendo <strong>no confiable</strong>. No debe servirse al usuario desde esta ubicación.</p>
+
+<div class="box"><strong>Regla:</strong> un archivo en <code>quarantine</code> todavía no está aprobado.</div>
+
+<h2>5. Metadata enviada a Upload-MS</h2>
+
+<h3>Ejemplo: metadata</h3>
+<pre><code>const metadata = {
+  // Identificador interno del upload.
+  uuid,
+
+  // Nombre que tenía el archivo en el equipo del usuario.
+  originalName: file.originalname,
+
+  // Nombre físico generado por el Gateway.
+  storedName,
+
+  // MIME declarado al realizar el upload.
+  mimetype: file.mimetype,
+
+  // Tamaño en bytes.
+  size: file.size,
+
+  // Ubicación temporal que Upload-MS deberá inspeccionar.
+  path: quarantinePath,
+
+  // Momento en que Gateway recibió el archivo.
+  uploadedAt: new Date().toISOString(),
+};</code></pre>
+
+<p>Gateway utiliza <code>send()</code> porque necesita esperar el resultado del Upload-MS:</p>
+
+<h3>Ejemplo: comunicación Gateway → Upload-MS</h3>
+<pre><code>// send() envía un mensaje TCP y espera una respuesta.
+// El patrón "upload: validate" identifica la operación
+// que debe ejecutar Upload-MS.
+const validationResult = await firstValueFrom(
+  this.uploadClient.send(
+    { upload: 'validate' },
+    metadata,
+  ),
+);
+
+// firstValueFrom convierte el Observable de ClientProxy
+// en una Promise para poder utilizar await.
+//
+// validationResult contendrá, por ejemplo:
+// REJECTED o STRUCTURE_VALIDATED.</code></pre>
+
+<p>Upload-MS escucha con:</p>
+
+<pre><code>@MessagePattern({ upload: 'validate' })</code></pre>
+
+<h2>6. Validación 1: firma o magic bytes</h2>
+
+<p>Upload-MS lee el archivo desde cuarentena y comprueba la firma PDF:</p>
+
+<h3>Ejemplo: inspección de los bytes reales</h3>
+<pre><code>// Upload-MS abre el archivo que Gateway dejó aislado
+// en quarantine/. En este punto ya no confiamos
+// solamente en nombre o MIME.
+const fileBuffer =
+  await readFile(data.path);
+
+// Tomamos los primeros cinco bytes del archivo.
+// Un PDF normal comienza con la firma ASCII "%PDF-".
+const signature = fileBuffer
+  .subarray(0, 5)
+  .toString('ascii');
+
+// Si alguien renombró un TXT, BAT u otro archivo como .pdf,
+// esta comparación permite detectar que el contenido
+// no presenta la firma esperada.
+if (signature !== '%PDF-') {
+  return {
+    status: 'REJECTED',
+    reason:
+      'La firma del archivo no corresponde a un PDF',
+  };
+}</code></pre>
+
+<p>Esto permite detectar archivos renombrados como <code>.pdf</code> cuyo contenido real no es PDF.</p>
+
+<h2>7. Validación 2: estructura PDF</h2>
+
+<p>Una firma correcta no alcanza. Upload-MS intenta interpretar el archivo con <code>pdf-lib</code>:</p>
+
+<h3>Ejemplo: validación estructural</h3>
+<pre><code>// Haber encontrado "%PDF-" no demuestra por sí solo
+// que el resto del archivo forme un PDF válido.
+//
+// pdf-lib intenta interpretar la estructura completa.
+const pdf =
+  await PDFDocument.load(fileBuffer);
+
+// Si PDFDocument.load() no puede interpretar el documento,
+// lanza una excepción y el archivo termina como REJECTED.
+//
+// Si carga correctamente podemos consultar propiedades
+// estructurales, por ejemplo la cantidad de páginas.
+const pages =
+  pdf.getPageCount();</code></pre>
+<p>Esta segunda capa detectó correctamente nuestra prueba <code>falso-estructural.pdf</code>: tenía <code>%PDF-</code>, pero no poseía una estructura PDF válida.</p>
+
+<p>Si la estructura no puede interpretarse como PDF, se devuelve:</p>
+
+<pre>{
+  "status": "REJECTED",
+  "reason": "La estructura interna del PDF no es válida"
+}</pre>
+
+<p>Si pasa firma y estructura:</p>
+
+<pre>{
+  "detectedType": "PDF",
+  "signature": "%PDF-",
+  "pages": 4,
+  "status": "STRUCTURE_VALIDATED"
+}</pre>
+
+<h2>8. Archivo rechazado</h2>
+
+<p>Si Upload-MS responde <code>REJECTED</code>, el Gateway elimina el archivo físico de cuarentena.</p>
+
+<h3>Ejemplo: eliminación de un archivo rechazado</h3>
+<pre><code>// Upload-MS no elimina archivos.
+// Solamente informa el resultado de su análisis.
+//
+// Gateway sigue siendo el propietario del almacenamiento.
+if (validationResult.status === 'REJECTED') {
+
+  // unlink() elimina físicamente el archivo
+  // que había quedado temporalmente en quarantine/.
+  await unlink(quarantinePath);
+
+  console.log(
+    'Archivo rechazado y eliminado de cuarentena:',
+  );
+  console.log(quarantinePath);
+}</code></pre>
+
+<pre>REJECTED
+   |
+   v
+Gateway
+   |
+   v
+unlink()
+   |
+   v
+ELIMINADO</pre>
+
+<h2>9. Archivo estructuralmente válido</h2>
+
+<p>Para el alcance actual del prototipo, cuando Upload-MS devuelve <code>STRUCTURE_VALIDATED</code>, el Gateway mueve el archivo de cuarentena a <code>verified/</code>.</p>
+
+<h3>Ejemplo: salida de cuarentena</h3>
+<pre><code>// Preparamos la ubicación final para los archivos
+// que superaron las validaciones implementadas.
+const verifiedPath = join(
+  process.cwd(),
+  'uploads',
+  'verified',
+  storedName,
+);
+
+// Upload-MS devuelve STRUCTURE_VALIDATED cuando:
+// 1) la firma corresponde a PDF;
+// 2) pdf-lib puede interpretar su estructura.
+if (
+  validationResult.status === 'STRUCTURE_VALIDATED'
+) {
+
+  // rename() mueve el archivo desde quarantine/
+  // hacia verified/. El Gateway realiza el movimiento
+  // porque es quien administra el almacenamiento físico.
+  await rename(
+    quarantinePath,
+    verifiedPath,
+  );
+
+  console.log(
+    'Archivo validado y movido a verified:',
+  );
+  console.log(verifiedPath);
+}</code></pre>
+
+<pre>STRUCTURE_VALIDATED
+        |
+        v
+     Gateway
+        |
+     rename()
+        |
+        v
+quarantine/UUID.pdf
+        |
+        v
+verified/UUID.pdf</pre>
+
+<div class="note"><strong>Aclaración:</strong> el estado sigue llamándose <code>STRUCTURE_VALIDATED</code> porque las validaciones implementadas hasta ahora son firma y estructura. La carpeta <code>verified/</code> representa la zona aprobada para el alcance actual del prototipo.</div>
+
+<h2>10. Pruebas realizadas</h2>
+
+<h3>PDF real</h3>
+<pre>Extensión       ✓
+MIME            ✓
+Firma %PDF-     ✓
+Estructura PDF  ✓
+
+Resultado:
+STRUCTURE_VALIDATED
+
+Gateway:
+quarantine → verified</pre>
+
+<h3>Texto disfrazado de PDF</h3>
+<pre>Extensión       ✓
+MIME            ✓
+Firma %PDF-     ✗
+
+Resultado:
+REJECTED
+
+Gateway:
+unlink() → eliminado</pre>
+
+<h3>Firma PDF falsa pero estructura inválida</h3>
+<pre>Extensión       ✓
+MIME            ✓
+Firma %PDF-     ✓
+Estructura PDF  ✗
+
+Resultado:
+REJECTED
+
+Gateway:
+unlink() → eliminado</pre>
+
+<h2>11. Flujo completo actual</h2>
+
+<pre>                     FRONTEND
+                         |
+                         v
+                    GATEWAY
+                         |
+                 Multer en memoria
+                         |
+           tamaño + extensión + MIME
+                         |
+                    genera UUID
+                         |
+                         v
+                  QUARANTINE
+                         |
+                    TCP metadata
+                         |
+                         v
+                    UPLOAD-MS
+                         |
+                  firma / magic
+                         |
+                  ¿firma válida?
+                   /          \
+                 NO            SÍ
+                 |              |
+             REJECTED       estructura PDF
+                 |              |
+                 |          ¿estructura válida?
+                 |           /            \
+                 |         NO              SÍ
+                 |         |                |
+                 |     REJECTED     STRUCTURE_VALIDATED
+                 |         |                |
+                 +----+----+                |
+                      |                     |
+                      v                     v
+                   Gateway              Gateway
+                      |                     |
+                   unlink()              rename()
+                      |                     |
+                      v                     v
+                  eliminado             verified/</pre>
+
+<h2>12. Responsabilidades actuales</h2>
+
+<table>
+<thead>
+<tr><th>Componente</th><th>Responsabilidad</th></tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Gateway</strong></td>
+<td>Recibir HTTP, Multer, validar tamaño/extensión/MIME, generar UUID, guardar en cuarentena, enviar metadata por TCP, eliminar rechazados y mover aprobados a verified.</td>
+</tr>
+<tr>
+<td><strong>Upload-MS</strong></td>
+<td>Leer el archivo de cuarentena, validar firma PDF, validar estructura con pdf-lib y devolver el resultado.</td>
+</tr>
+<tr>
+<td><strong>quarantine/</strong></td>
+<td>Zona temporal aislada para archivos todavía no aprobados.</td>
+</tr>
+<tr>
+<td><strong>verified/</strong></td>
+<td>Zona donde se mueven los archivos que superaron las validaciones implementadas.</td>
+</tr>
+</tbody>
+</table>
+
+
+<h2>14. Flujo de estados y respuesta entre Gateway y Upload-MS</h2>
+
+<p>El Gateway y Upload-MS se comunican mediante TCP usando el patrón <code>send()</code> / <code>@MessagePattern()</code>. El Gateway inicia la solicitud de validación y queda esperando la respuesta del microservicio.</p>
+
+<pre>Frontend
+   |
+   v
+Gateway
+   |
+   | 1. recibe archivo
+   | 2. valida tamaño / extensión / MIME
+   | 3. genera UUID
+   | 4. guarda en quarantine
+   |
+   | 5. send({ upload: 'validate' }, metadata)
+   v
+Upload-MS
+   |
+   | 6. lee archivo
+   | 7. valida firma
+   | 8. valida estructura
+   |
+   | 9. genera resultado
+   |    REJECTED
+   |       o
+   |    STRUCTURE_VALIDATED
+   |
+   | 10. return resultado
+   v
+Gateway
+   |
+   | 11. recibe resultado
+   |
+   +-- REJECTED ----------> unlink()
+   |
+   +-- STRUCTURE_VALIDATED -> rename()</pre>
+
+<h3>Gateway: envío y espera de respuesta</h3>
+
+<p>El Gateway utiliza <code>send()</code> porque necesita conocer el resultado antes de decidir qué hacer con el archivo físico.</p>
+
+<pre><code>// Gateway envía la metadata al Upload-MS.
+// El patrón identifica la operación que debe ejecutar.
+const validationResult = await firstValueFrom(
+  this.uploadClient.send(
+    { upload: 'validate' },
+    metadata,
+  ),
+);
+
+// firstValueFrom transforma el Observable de ClientProxy
+// en una Promise para poder esperar la respuesta con await.
+//
+// Mientras Upload-MS analiza el archivo, Gateway
+// permanece esperando este resultado.</code></pre>
+
+<p>La correspondencia entre ambos servicios es:</p>
+
+<pre>Gateway                                  Upload-MS
+
+send({ upload: 'validate' })  -------->  @MessagePattern({
+                                           upload: 'validate'
+                                         })</pre>
+
+<h3>Upload-MS: momento en que genera el estado</h3>
+
+<p>Upload-MS genera el estado <strong>durante la validación</strong>, justo antes de responder al Gateway.</p>
+
+<p>Si falla la firma:</p>
+
+<pre><code>if (signature !== '%PDF-') {
+  return {
+    uuid: data.uuid,
+    status: 'REJECTED',
+    reason:
+      'La firma del archivo no corresponde a un PDF',
+  };
+}</code></pre>
+
+<p>Ese <code>return</code> ya constituye la respuesta TCP que vuelve al Gateway.</p>
+
+<p>Si la estructura PDF es inválida:</p>
+
+<pre><code>catch (error) {
+  return {
+    uuid: data.uuid,
+    status: 'REJECTED',
+    reason:
+      'La estructura interna del PDF no es válida',
+  };
+}</code></pre>
+
+<p>Si supera ambas validaciones:</p>
+
+<pre><code>return {
+  uuid: data.uuid,
+  detectedType: 'PDF',
+  signature,
+  pages,
+  status: 'STRUCTURE_VALIDATED',
+};</code></pre>
+
+<h3>Gateway: decisión física sobre el archivo</h3>
+
+<p>El Gateway recibe el objeto devuelto por Upload-MS en <code>validationResult</code> y actúa sobre el archivo físico.</p>
+
+<pre><code>// Si Upload-MS decide que el archivo no es válido,
+// Gateway elimina el archivo de quarantine.
+if (validationResult.status === 'REJECTED') {
+  await unlink(quarantinePath);
+}
+
+// Si Upload-MS confirma firma y estructura,
+// Gateway mueve el archivo a verified.
+if (
+  validationResult.status === 'STRUCTURE_VALIDATED'
+) {
+  await rename(
+    quarantinePath,
+    verifiedPath,
+  );
+}</code></pre>
+
+<p>La separación de responsabilidades queda así:</p>
+
+<pre>UPLOAD-MS
+    |
+    | decide estado
+    v
+REJECTED / STRUCTURE_VALIDATED
+    |
+    | respuesta TCP
+    v
+GATEWAY
+    |
+    | actúa sobre archivo físico
+    |
+    +--> unlink()
+    |
+    +--> rename()</pre>
+
+<div class="box">
+<strong>Principio de diseño:</strong><br><br>
+El Gateway es propietario del archivo físico. Upload-MS es propietario de la decisión de validación. Upload-MS no borra ni mueve archivos: informa el resultado. Gateway interpreta ese estado y ejecuta la acción correspondiente sobre <code>quarantine/</code> o <code>verified/</code>.
+</div>
+
+<h3>Flujo futuro con MongoDB</h3>
+
+<p>Cuando se incorpore MongoDB en Upload-MS, el microservicio podrá persistir el estado antes de responder al Gateway.</p>
+
+<pre>Gateway
+   |
+   | archivo en quarantine
+   |
+   v
+Upload-MS
+   |
+   +--> MongoDB
+   |    status = VALIDATING
+   |
+   +--> valida firma
+   |
+   +--> valida estructura
+   |
+   +--> MongoDB
+   |    status = REJECTED
+   |        o
+   |    status = STRUCTURE_VALIDATED
+   |
+   +--> return resultado
+             |
+             v
+          Gateway
+             |
+             +--> unlink()
+             |
+             +--> rename()</pre>
+
+<p>Esto permitirá conservar trazabilidad incluso cuando el archivo rechazado ya haya sido eliminado físicamente.</p>
+
+<h2>13. Pendiente para próximas etapas</h2>
+<ul>
+  <li>MongoDB en Upload-MS para metadata y estados.</li>
+  <li>Relacionar UUID con usuario autenticado.</li>
+  <li>Validación específica de PNG/JPG.</li>
+  <li>Validación específica de DOCX/XLSX.</li>
+  <li>Endpoint seguro para descargar archivos de verified.</li>
+  <li>Docker Volume persistente para VPS.</li>
+  <li>Antivirus/scanner especializado si se amplía el nivel de seguridad.</li>
+  <li>Logs de eventos de upload en Logs-MS.</li>
+</ul>
+
+<div class="box">
+<strong>Conclusión:</strong><br><br>
+El flujo implementado demuestra que extensión y MIME no bastan. El Gateway aplica controles rápidos y conserva el archivo físico; Upload-MS inspecciona el contenido real. Si la firma o la estructura PDF fallan, el archivo se elimina. Si ambas validaciones pasan, el Gateway lo mueve desde cuarentena a la zona <code>verified/</code>.
+</div>
+
+</body>
+</html>
